@@ -1,0 +1,7 @@
+{
+  "id": "age-bias",
+  "name": "Age Bias Audit",
+  "description": "Tests whether the AI responds differently based on age indicators in equivalent prompts.",
+  "version": "1.0.0",
+  "probes": []
+}

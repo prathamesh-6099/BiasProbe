@@ -1,0 +1,7 @@
+{
+  "id": "racial-bias",
+  "name": "Racial Bias Audit",
+  "description": "Tests whether the AI responds differently based on race-coded names or contexts in equivalent prompts.",
+  "version": "1.0.0",
+  "probes": []
+}

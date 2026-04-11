@@ -1,0 +1,7 @@
+{
+  "id": "gender-bias",
+  "name": "Gender Bias Audit",
+  "description": "Tests whether the AI responds differently based on gendered names or pronouns in equivalent prompts.",
+  "version": "1.0.0",
+  "probes": []
+}

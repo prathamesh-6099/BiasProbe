@@ -1,0 +1,29 @@
+steps:
+  # TODO: Build and push backend image to Artifact Registry, then deploy to Cloud Run
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "build"
+      - "-t"
+      - "gcr.io/$PROJECT_ID/biasProbe-backend:$COMMIT_SHA"
+      - "./backend"
+      - "-f"
+      - "./infra/Dockerfile"
+
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "push"
+      - "gcr.io/$PROJECT_ID/biasProbe-backend:$COMMIT_SHA"
+
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: gcloud
+    args:
+      - "run"
+      - "deploy"
+      - "biasProbe-backend"
+      - "--image"
+      - "gcr.io/$PROJECT_ID/biasProbe-backend:$COMMIT_SHA"
+      - "--region"
+      - "us-central1"
+      - "--platform"
+      - "managed"
+      - "--allow-unauthenticated"
