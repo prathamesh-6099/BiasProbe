@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
-google-generativeai
+google-genai
 firebase-admin
 google-cloud-storage
 google-cloud-bigquery
@@ -10,3 +10,5 @@ pandas
 httpx
 reportlab
 python-dotenv
+pydantic>=2.0
+python-multipart
