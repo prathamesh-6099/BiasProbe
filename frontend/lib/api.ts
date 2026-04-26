@@ -34,7 +34,9 @@ async function apiFetch<T>(
     let detail = `HTTP ${res.status}`;
     try {
       const data = await res.json();
-      detail = data?.detail ?? detail;
+      if (data?.detail) {
+        detail = typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail);
+      }
     } catch (_) {}
     throw new Error(detail);
   }
@@ -47,21 +49,31 @@ async function apiFetch<T>(
 // --------------------------------------------------------------------------
 
 export interface AuditCreatePayload {
-  label:             string;
+  label?:            string;
   scenario:          string;
-  provider:          string;
-  model:             string;
-  api_key:           string;
-  system_prompt?:    string;
-  probe_count:       number;
-  attributes:        string[];
+  num_probes:        number;
+  attribute_filter:  string[];
+  connector: {
+    provider:       string;
+    model:          string;
+    api_key?:       string;
+    base_url?:      string;   // override for mock API / Azure / Together
+    system_prompt?: string;
+  };
 }
 
 export interface AuditStatus {
-  audit_id:   string;
-  status:     string;
-  progress?:  number;  // 0-100
-  message?:   string;
+  audit_id:        string;
+  status:          string;
+  progress?:       number;  // 0-100 (legacy)
+  percent_done?:   number;  // 0-100 (from backend)
+  probes_sent?:    number;
+  probes_complete?: number;
+  probes_success?: number;
+  probes_failed?:  number;
+  scenario?:       string;
+  label?:          string;
+  message?:        string;
 }
 
 export interface AuditResults {
@@ -179,19 +191,63 @@ export const api = {
         method: "POST",
       }),
 
+    runWithConfig: (auditId: string, connector: AuditCreatePayload["connector"]) =>
+      apiFetch<{ audit_id: string; status: string }>(`/api/audit/${auditId}/run-with-config`, {
+        method: "POST",
+        body: JSON.stringify({ connector }),
+      }),
+
     status: (auditId: string) =>
       apiFetch<AuditStatus>(`/api/audit/${auditId}/status`),
 
-    results: (auditId: string) =>
-      apiFetch<AuditResults>(`/api/audit/${auditId}/results`),
+    results: async (auditId: string): Promise<AuditResults> => {
+      let stats: any = null;
+      let judgements: any[] = [];
+
+      // Stats may not be available (e.g. 202 if analysis hasn't run yet)
+      try {
+        stats = await apiFetch<any>(`/api/stats/${auditId}/report`);
+      } catch (e: any) {
+        console.warn("Stats not available:", e.message);
+      }
+
+      try {
+        const judgementsRes = await apiFetch<any>(`/api/judge/${auditId}/judgements?limit=50`);
+        judgements = judgementsRes.judgements || [];
+      } catch (e: any) {
+        console.warn("Judgements not available:", e.message);
+      }
+
+      return {
+        audit_id: auditId,
+        status: stats ? "analysed" : "partial",
+        fairness_score: stats?.overall_fairness_score ?? 0,
+        risk_level: stats?.overall_severity ?? "unknown",
+        per_attribute: stats?.per_attribute ?? {},
+        judgements,
+        regulatory_flags: stats?.unique_regulations_triggered ?? [],
+      };
+    },
 
     list: () =>
       apiFetch<{ audits: AuditListItem[] }>("/api/audit/list"),
 
-    testConnection: (provider: string, apiKey: string, model: string) =>
+    testConnection: (
+      provider: string,
+      apiKey: string,
+      model: string,
+      baseUrl?: string,
+      systemPrompt?: string,
+    ) =>
       apiFetch<{ ok: boolean; message?: string }>("/api/audit/test-connection", {
         method: "POST",
-        body: JSON.stringify({ provider, api_key: apiKey, model }),
+        body: JSON.stringify({
+          provider,
+          api_key: apiKey,
+          model,
+          ...(baseUrl      ? { base_url:      baseUrl      } : {}),
+          ...(systemPrompt ? { system_prompt: systemPrompt } : {}),
+        }),
       }),
   },
 

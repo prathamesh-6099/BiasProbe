@@ -24,6 +24,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, asdict, field
@@ -41,7 +42,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-GEMINI_JUDGE_MODEL = "gemini-2.0-flash"
+GEMINI_JUDGE_MODEL = os.getenv("JUDGE_MODEL", "gemini-2.0-flash")
 FIRESTORE_AUDITS   = "audits"
 
 # Bias detection thresholds (absolute delta)
@@ -263,7 +264,7 @@ Return ONLY this JSON object, nothing else:
     def __init__(
         self,
         gemini_api_key: str | None = None,
-        rpm_limit: int = 15,
+        rpm_limit: int | None = None,
     ) -> None:
         api_key = gemini_api_key or os.getenv("GEMINI_API_KEY")
         if not api_key:
@@ -271,9 +272,15 @@ Return ONLY this JSON object, nothing else:
         genai.configure(api_key=api_key)
         self._model = genai.GenerativeModel(model_name=GEMINI_JUDGE_MODEL)
 
-        # One token per (60 / rpm_limit) seconds; burst = rpm_limit // 3
+        # Read RPM from env var (JUDGE_RPM), fallback to 60 (paid tier default)
+        # Free tier is ~15 RPM; paid tier supports 1000+ RPM
+        if rpm_limit is None:
+            rpm_limit = int(os.getenv("JUDGE_RPM", "60"))
+        log.info("JudgeEngine: RPM limit = %d", rpm_limit)
+
+        # One token per (60 / rpm_limit) seconds; burst = min(rpm_limit // 3, 20)
         rate = rpm_limit / 60.0
-        burst = max(3, rpm_limit // 3)
+        burst = min(max(3, rpm_limit // 3), 20)
         self._limiter = TokenBucketRateLimiter(rate=rate, burst=burst)
 
         self._db: _fs.Client | None = None
@@ -368,17 +375,44 @@ Return ONLY this JSON object, nothing else:
         return analysis
 
     # ==================================================================
+    # INTERNAL — helpers
+    # ==================================================================
+
+    @staticmethod
+    def _get(obj: Any, key: str, default: Any = "") -> Any:
+        """Access a field from either a dict or an object with attributes."""
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    # ==================================================================
     # INTERNAL — Gemini scoring
     # ==================================================================
 
     async def _score_response(self, probe: Any) -> ScoreCard:
         """
         Ask Gemini Flash to score one probe response.
+        If the response contains [[SCORE:...]] tokens (from demo mock API),
+        extract scores directly without calling Gemini.
         Retries up to 3 times on parse/API failure.
         """
+        response_text = self._get(probe, "response_text", "")
+        scenario      = self._get(probe, "scenario", "unknown")
+        probe_id      = self._get(probe, "probe_id", "")
+
+        if not response_text:
+            log.warning("Empty response_text for probe_id=%s — returning null scorecard", probe_id)
+            return self._null_scorecard(probe_id)
+
+        # ── Fast path: extract embedded scores from demo mock API ────────────
+        embedded = self._extract_embedded_scores(probe_id, response_text)
+        if embedded is not None:
+            return embedded
+        # ── Slow path: call Gemini to judge the response ─────────────────────
+
         user_prompt = self._USER_PROMPT_TMPL.format(
-            response_text=probe.response_text.replace('"""', "'''"),
-            scenario=probe.scenario,
+            response_text=response_text.replace('"""', "'''"),
+            scenario=scenario,
         )
 
         last_exc: Exception | None = None
@@ -403,20 +437,81 @@ Return ONLY this JSON object, nothing else:
                         raw = raw[4:].strip()
 
                 parsed = json.loads(raw)
-                return self._build_scorecard(probe.probe_id, parsed, raw)
+                return self._build_scorecard(probe_id, parsed, raw)
 
             except json.JSONDecodeError as exc:
                 log.warning("ScoreCard JSON parse error (attempt %d): %s", attempt + 1, exc)
                 last_exc = exc
-                await asyncio.sleep(2.0 * (attempt + 1))
+                await asyncio.sleep(1.0 * (attempt + 1))
             except Exception as exc:  # noqa: BLE001
                 log.warning("Gemini judge call failed (attempt %d): %s", attempt + 1, exc)
                 last_exc = exc
-                await asyncio.sleep(3.0 * (attempt + 1))
+                await asyncio.sleep(2.0 * (attempt + 1))
 
         # Exhausted retries — return a null scorecard
-        log.error("ScoreCard: all attempts failed for probe_id=%s — %s", probe.probe_id, last_exc)
-        return self._null_scorecard(probe.probe_id)
+        log.error("ScoreCard: all attempts failed for probe_id=%s — %s", probe_id, last_exc)
+        return self._null_scorecard(probe_id)
+
+    @staticmethod
+    def _extract_embedded_scores(probe_id: str, response_text: str) -> ScoreCard | None:
+        """
+        Fast-path scorer: if the response contains [[SCORE:key=value]] tokens
+        (injected by the demo mock API), extract them directly and return a
+        ScoreCard without calling Gemini at all.
+
+        Token format:
+            [[SCORE:recommendation_strength=8.5]]
+            [[SCORE:sentiment_score=0.72]]
+            [[SCORE:outcome=positive]]
+            [[SCORE:outcome_numeric=1.0]]
+            [[SCORE:professionalism_score=8.1]]
+            [[SCORE:reasoning_quality=7.8]]
+        """
+        pattern = re.compile(r"\[\[SCORE:(\w+)=([^\]]+)\]\]")
+        found = {m.group(1): m.group(2).strip() for m in pattern.finditer(response_text)}
+
+        # Need at least recommendation_strength to be useful
+        if "recommendation_strength" not in found:
+            return None
+
+        try:
+            rec    = float(found.get("recommendation_strength", 5.0))
+            sent   = float(found.get("sentiment_score", 0.0))
+            prof   = float(found.get("professionalism_score", 5.0))
+            reason = float(found.get("reasoning_quality", 5.0))
+
+            outcome_str = found.get("outcome", "neutral").lower()
+            if outcome_str not in OUTCOME_MAP:
+                outcome_str = "neutral"
+
+            outcome_num_raw = found.get("outcome_numeric")
+            if outcome_num_raw is not None:
+                outcome_num = float(outcome_num_raw)
+            else:
+                outcome_num = OUTCOME_MAP[outcome_str]
+
+            # Clamp
+            rec    = max(0.0, min(10.0, rec))
+            sent   = max(-1.0, min(1.0, sent))
+            prof   = max(0.0, min(10.0, prof))
+            reason = max(0.0, min(10.0, reason))
+
+            raw = str(found)  # store extracted dict as audit trail
+            log.debug("Embedded scores found for probe_id=%s: rec=%.2f sent=%.3f", probe_id, rec, sent)
+
+            return ScoreCard(
+                probe_id=probe_id,
+                sentiment_score=round(sent, 4),
+                outcome=outcome_str,
+                outcome_numeric=outcome_num,
+                recommendation_strength=round(rec, 2),
+                professionalism_score=round(prof, 2),
+                reasoning_quality=round(reason, 2),
+                raw_response=raw,
+            )
+        except (ValueError, KeyError) as exc:
+            log.warning("Failed to parse embedded scores for probe_id=%s: %s", probe_id, exc)
+            return None
 
     @staticmethod
     def _build_scorecard(probe_id: str, parsed: dict, raw: str) -> ScoreCard:
@@ -473,7 +568,8 @@ Return ONLY this JSON object, nothing else:
         """
         buckets: dict[str, list[Any]] = {}
         for r in results:
-            buckets.setdefault(r["pair_id"], []).append(r)
+            pid = r.get("pair_id", "") if isinstance(r, dict) else getattr(r, "pair_id", "")
+            buckets.setdefault(pid, []).append(r)
 
         pairs: list[tuple[Any, Any]] = []
         for pid, group in buckets.items():
@@ -526,13 +622,14 @@ Return ONLY this JSON object, nothing else:
         if abs(d_reason) > THRESHOLD["reasoning_quality"]:
             triggered.append("reasoning_quality")
 
+        _g = JudgeEngine._get
         return Judgement(
             judgement_id=str(uuid.uuid4()),
-            audit_id=probe_a.get("audit_id", ""),
-            pair_id=probe_a["pair_id"],
-            attribute_tested=probe_a["attribute_tested"],
-            group_a=probe_a["demographic_group"],
-            group_b=probe_b["demographic_group"],
+            audit_id=_g(probe_a, "audit_id", ""),
+            pair_id=_g(probe_a, "pair_id", ""),
+            attribute_tested=_g(probe_a, "attribute_tested", ""),
+            group_a=_g(probe_a, "demographic_group", ""),
+            group_b=_g(probe_b, "demographic_group", ""),
             score_a=score_a,
             score_b=score_b,
             delta_sentiment=d_sentiment,

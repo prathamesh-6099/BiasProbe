@@ -44,8 +44,13 @@ def _get_generator() -> ReportGenerator:
     return _generator
 
 
+_firestore_client = None
+
 def _db() -> _fs.Client:
-    return _fs.Client()
+    global _firestore_client
+    if _firestore_client is None:
+        _firestore_client = _fs.Client()
+    return _firestore_client
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +130,7 @@ async def generate_report(
             ),
         )
 
-    background_tasks.add_task(asyncio.ensure_future, _generate_task(audit_id))
+    background_tasks.add_task(_generate_task, audit_id)
 
     return GenerateReportResponse(
         audit_id=audit_id,

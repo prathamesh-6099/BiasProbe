@@ -53,7 +53,7 @@ SCENARIO_FILE_MAP: dict[str, str] = {
     "content_moderator": "content_moderator.json",
 }
 
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-2.5-flash-lite"
 GCS_BUCKET = os.getenv("GCS_BUCKET_NAME", "biasprobeaudit-batteries")
 FIRESTORE_COLLECTION = "probe_batteries"
 
@@ -160,84 +160,107 @@ class ProbeGenerator:
         attribute_filter: list[str] | None = None,
     ) -> list[ProbeSet]:
         """
-        Generate a PAIRED probe battery using Gemini Flash.
+        Generate a PAIRED probe battery from the scenario template.
 
-        For each (base_prompt, protected_attribute) combination:
-        - Gemini is asked to produce probe variants for every demographic
-          group under that attribute.
-        - Probes produced in the same Gemini call share a `pair_id`.
-        - The total battery is trimmed / padded to roughly `num_probes`.
+        Steps
+        -----
+        1. Load the JSON template for the scenario.
+        2. Determine which attributes to test (filtered if attribute_filter set).
+        3. For each (base_prompt × attribute) combination, call Gemini to
+           expand into demographic-paired probe sets.
+        4. Trim to num_probes while preserving pair integrity.
+        5. Return the battery.
 
         Parameters
         ----------
-        scenario : str
-            Scenario key, e.g. "hiring_assistant".
-        num_probes : int
-            Target number of probes (must be even; rounded up if odd).
-        attribute_filter : list[str] | None
-            Restrict generation to specific protected attributes.
-            If None, all attributes in the template are used.
+        scenario        : str  — key in SCENARIO_FILE_MAP
+        num_probes      : int  — target probe count (pairs × groups_per_pair)
+        attribute_filter: list[str] | None — e.g. ["gender", "age"]; None = all
 
         Returns
         -------
         list[ProbeSet]
-            Flat list of ProbeSet objects ready for execution.
         """
-        if num_probes % 2 != 0:
-            num_probes += 1  # Ensure an even number for clean pairing
-
         template = self.load_template(scenario)
-        protected_attributes: list[str] = template["protected_attributes"]
-        demographic_variants: dict = template["demographic_variants"]
-        base_prompts: list[str] = template["base_prompts"]
 
+        all_attributes: list[str] = template.get("protected_attributes", [])
+        demo_variants: dict = template.get("demographic_variants", {})
+        base_prompts: list[str] = template.get("base_prompts", [])
+        roles: list[str] = template.get("roles", ["professional"])
+
+        # Normalise attribute filter
         if attribute_filter:
-            protected_attributes = [
-                a for a in protected_attributes if a in attribute_filter
-            ]
+            norm = [a.lower().strip() for a in attribute_filter]
+            all_attributes = [a for a in all_attributes if a.lower() in norm]
+
+        if not all_attributes:
+            raise ValueError(
+                f"No valid attributes to test for scenario '{scenario}' "
+                f"with filter {attribute_filter}."
+            )
+        if not base_prompts:
+            raise ValueError(f"Template for '{scenario}' has no base_prompts.")
 
         log.info(
-            "Generating battery: scenario=%s  target=%d probes  attributes=%s",
-            scenario, num_probes, protected_attributes,
+            "Generating battery: scenario=%s  num_probes=%d  attributes=%s",
+            scenario, num_probes, all_attributes,
         )
+
+        # How many pairs do we need in total?
+        # pairs_per_attr × len(attributes) × avg_group_size ≈ num_probes
+        # We'll aim for ceil(num_probes / len(all_attributes)) pairs per attribute
+        pairs_per_attribute = max(2, -(-num_probes // max(len(all_attributes), 1)))
 
         all_probes: list[ProbeSet] = []
 
-        # Determine per-call budget so we hit ~num_probes total
-        total_combinations = len(base_prompts) * len(protected_attributes)
-        probes_per_call = max(2, round(num_probes / max(total_combinations, 1)))
-        # Always generate in groups equal to the number of demographic groups
-        # so pairing is auto-satisfied.
+        for attr in all_attributes:
+            variants = demo_variants.get(attr)
+            if not variants:
+                log.warning("No demographic variants for attribute '%s' — skipping", attr)
+                continue
 
-        for bp_idx, base_prompt in enumerate(base_prompts):
-            for attribute in protected_attributes:
-                variants = demographic_variants.get(attribute)
-                if not variants:
-                    continue
+            # Distribute pairs evenly across base_prompts
+            pairs_remaining = pairs_per_attribute
+            bp_cycle = itertools.cycle(enumerate(base_prompts))
 
-                group_names = list(variants.keys())
-                # Number of paired sets to request from Gemini for this call
-                pairs_needed = max(1, probes_per_call // len(group_names))
+            while pairs_remaining > 0:
+                bp_idx, base_prompt = next(bp_cycle)
+                role = random.choice(roles)
+                # Substitute {role} placeholder if present
+                filled_prompt = base_prompt.replace("{role}", role)
 
+                chunk_size = min(pairs_remaining, 5)  # Gemini call ≤ 5 pairs at once
                 probes = self._call_gemini(
                     scenario=scenario,
-                    base_prompt=base_prompt,
+                    base_prompt=filled_prompt,
                     bp_idx=bp_idx,
-                    attribute=attribute,
+                    attribute=attr,
                     variants=variants,
-                    pairs_needed=pairs_needed,
+                    pairs_needed=chunk_size,
                     template=template,
                 )
-                all_probes.extend(probes)
-                # Small delay to respect API rate limits
-                time.sleep(0.3)
+                if probes:
+                    all_probes.extend(probes)
+                    pairs_remaining -= chunk_size
+                else:
+                    log.warning(
+                        "Gemini returned no probes for attr=%s bp_idx=%d — breaking inner loop",
+                        attr, bp_idx,
+                    )
+                    break
 
-        log.info("Raw battery size before trim: %d probes", len(all_probes))
+        if not all_probes:
+            raise ValueError(
+                f"Probe generation produced 0 probes for scenario '{scenario}'. "
+                "Check GEMINI_API_KEY and template files."
+            )
 
-        # Trim to target while preserving pair integrity
-        all_probes = self._trim_to_target(all_probes, num_probes)
-        log.info("Final battery size: %d probes", len(all_probes))
-        return all_probes
+        trimmed = self._trim_to_target(all_probes, num_probes)
+        log.info(
+            "Battery ready: scenario=%s  total=%d  after_trim=%d",
+            scenario, len(all_probes), len(trimmed),
+        )
+        return trimmed
 
     # ------------------------------------------------------------------
     # 3. Gemini call — single (base_prompt × attribute)
@@ -425,18 +448,9 @@ Rules:
         gcs_path = f"batteries/{audit_id}/battery.json"
         gcs_uri = f"gs://{GCS_BUCKET}/{gcs_path}"
 
-        # --- GCS upload ---
-        try:
-            bucket = self.gcs.bucket(GCS_BUCKET)
-            blob = bucket.blob(gcs_path)
-            blob.upload_from_string(
-                json.dumps([p.to_dict() for p in battery], indent=2, ensure_ascii=False),
-                content_type="application/json",
-            )
-            log.info("Battery uploaded to %s", gcs_uri)
-        except Exception as exc:  # noqa: BLE001
-            log.error("GCS upload failed: %s", exc)
-            raise
+        # --- GCS upload (SKIPPED) ---
+        # Bypassed GCS entirely to prevent hanging due to lack of billing.
+        log.info("Skipping GCS upload, data will only be saved to Firestore.")
 
         # --- Firestore: metadata document ---
         try:
@@ -488,8 +502,8 @@ Rules:
     # ------------------------------------------------------------------
     def load_battery(self, audit_id: str) -> list[ProbeSet]:
         """
-        Reload a previously saved battery from GCS.
-
+        Reload a previously saved battery from Firestore (bypassing GCS).
+        
         Parameters
         ----------
         audit_id : str
@@ -499,8 +513,14 @@ Rules:
         -------
         list[ProbeSet]
         """
-        gcs_path = f"batteries/{audit_id}/battery.json"
-        bucket = self.gcs.bucket(GCS_BUCKET)
-        blob = bucket.blob(gcs_path)
-        raw = blob.download_as_text(encoding="utf-8")
-        return [ProbeSet(**d) for d in json.loads(raw)]
+        audit_ref = self.db.collection(FIRESTORE_COLLECTION).document(audit_id)
+        probes_ref = audit_ref.collection("probes").stream()
+        
+        battery = []
+        for doc in probes_ref:
+            battery.append(ProbeSet(**doc.to_dict()))
+            
+        if not battery:
+            log.warning("No probes found in Firestore for audit %s", audit_id)
+            
+        return battery

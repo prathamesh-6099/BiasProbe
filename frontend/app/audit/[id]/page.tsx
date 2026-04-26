@@ -2,9 +2,9 @@
 /**
  * app/audit/[id]/page.tsx — Live audit results page
  */
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { Loader2, FileText, AlertTriangle, CheckCircle2, ChevronRight, Shield } from "lucide-react";
+import { Loader2, FileText, AlertTriangle, CheckCircle2, ChevronRight, Shield, ArrowLeft, SearchX } from "lucide-react";
 import { cn, riskBadgeClass, scoreColor } from "@/lib/utils";
 import { api, AuditResults, AuditStatus, JudgementPair } from "@/lib/api";
 import FairnessGauge from "@/components/FairnessGauge";
@@ -12,12 +12,15 @@ import BiasHeatmap from "@/components/BiasHeatmap";
 import ProbeComparison from "@/components/ProbeComparison";
 
 const STATUS_LABELS: Record<string, string> = {
-  created: "Audit created — waiting to start…", running: "Running probes…",
-  judging: "Judging responses with Gemini…", analysing: "Running statistical analysis…",
-  analysed: "Analysis complete", complete: "Audit complete", judged: "Judgement complete",
-  failed: "Audit failed", generating_report: "Generating compliance report…", report_ready: "Report ready",
+  created: "Audit created — waiting to start…", battery_ready: "Battery ready — starting probes…",
+  running: "Running probes…", probes_complete: "Probes complete — starting judgement…",
+  judging: "Judging responses with Gemini…", judged: "Judgement complete — running analysis…",
+  analysing: "Running statistical analysis…",
+  analysed: "Analysis complete", complete: "Audit complete",
+  failed: "Audit failed", judge_failed: "Judgement failed", stats_failed: "Analysis failed",
+  generating_report: "Generating compliance report…", report_ready: "Report ready",
 };
-const TERMINAL = new Set(["analysed", "complete", "judged", "report_ready", "failed"]);
+const TERMINAL = new Set(["analysed", "complete", "judged", "report_ready", "failed", "judge_failed", "stats_failed"]);
 
 export default function AuditPage() {
   const { id: auditId } = useParams<{ id: string }>();
@@ -25,32 +28,67 @@ export default function AuditPage() {
   const [status, setStatus] = useState<AuditStatus | null>(null);
   const [results, setResults] = useState<AuditResults | null>(null);
   const [error, setError] = useState("");
+  const [notFound, setNotFound] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [worstPairs, setWorstPairs] = useState<JudgementPair[]>([]);
+  const stoppedRef = useRef(false);
+  const errorCountRef = useRef(0);
 
   const fetchStatus = useCallback(async () => {
+    if (stoppedRef.current) return;
     try {
       const s = await api.audit.status(auditId);
+      errorCountRef.current = 0; // reset on success
       setStatus(s);
       if (TERMINAL.has(s.status)) {
-        const r = await api.audit.results(auditId);
-        setResults(r);
-        if (r.judgements?.length) {
-          const sorted = [...r.judgements].sort((a, b) => Math.abs(b.composite_delta) - Math.abs(a.composite_delta));
-          setWorstPairs(sorted.slice(0, 3));
+        stoppedRef.current = true;
+        try {
+          const r = await api.audit.results(auditId);
+          setResults(r);
+          if (r.judgements?.length) {
+            const sorted = [...r.judgements].sort((a, b) => Math.abs(b.composite_delta) - Math.abs(a.composite_delta));
+            setWorstPairs(sorted.slice(0, 3));
+          }
+        } catch (resErr: any) {
+          // Results may not be available for failed audits — that's ok
+          if (!s.status.includes("failed")) {
+            setError(resErr.message ?? "Failed to load results");
+          }
         }
       }
-    } catch (err: any) { setError(err.message ?? "Failed to load audit"); }
+    } catch (err: any) {
+      const msg = err.message ?? "Failed to load audit";
+      // Stop polling on 404 (audit doesn't exist)
+      if (msg.includes("not found") || msg.includes("404")) {
+        stoppedRef.current = true;
+        setNotFound(true);
+        setError(msg);
+        return;
+      }
+      // Stop polling after 5 consecutive errors
+      errorCountRef.current++;
+      if (errorCountRef.current >= 5) {
+        stoppedRef.current = true;
+        setError(`${msg} (stopped after ${errorCountRef.current} failures)`);
+        return;
+      }
+      setError(msg);
+    }
   }, [auditId]);
 
   useEffect(() => {
+    stoppedRef.current = false;
+    errorCountRef.current = 0;
     fetchStatus();
     const iv = setInterval(() => {
-      if (status && TERMINAL.has(status.status)) { clearInterval(iv); return; }
+      if (stoppedRef.current || (status && TERMINAL.has(status.status))) {
+        clearInterval(iv);
+        return;
+      }
       fetchStatus();
     }, 3000);
     return () => clearInterval(iv);
-  }, [fetchStatus, status]);
+  }, [fetchStatus]);
 
   async function generateReport() {
     setGenerating(true);
@@ -64,9 +102,30 @@ export default function AuditPage() {
     } catch (err: any) { setError(err.message ?? "Report failed"); setGenerating(false); }
   }
 
-  const isRunning = !status || !TERMINAL.has(status.status);
-  const isFailed  = status?.status === "failed";
-  const progress  = status?.progress ?? 0;
+  const isRunning = !notFound && (!status || !TERMINAL.has(status.status));
+  const isFailed  = status?.status === "failed" || status?.status === "judge_failed" || status?.status === "stats_failed";
+  const progress  = status?.percent_done ?? status?.progress ?? 0;
+
+  // --- Not Found screen ---
+  if (notFound) {
+    return (
+      <div className="max-w-xl mx-auto px-6 py-20 text-center space-y-6 animate-fade-in">
+        <SearchX className="h-16 w-16 text-gray-300 mx-auto" />
+        <h1 className="text-2xl font-bold text-[#1A1A2E]">Audit Not Found</h1>
+        <p className="text-gray-500">
+          The audit <code className="bg-gray-100 px-2 py-0.5 rounded text-xs font-mono">{auditId}</code> doesn&apos;t exist or has been deleted.
+        </p>
+        <div className="flex items-center justify-center gap-3 pt-2">
+          <button onClick={() => router.push("/dashboard")} className="btn-secondary flex items-center gap-2">
+            <ArrowLeft className="h-4 w-4" /> Dashboard
+          </button>
+          <button onClick={() => router.push("/audit/new")} className="btn-primary">
+            Start New Audit
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="max-w-5xl mx-auto px-6 py-10 space-y-8">
@@ -78,7 +137,7 @@ export default function AuditPage() {
         {results && <span className={cn("badge mt-1", riskBadgeClass(results.risk_level))}>{results.risk_level?.replace(/_/g, " ").toUpperCase()}</span>}
       </div>
 
-      {error && (
+      {error && !notFound && (
         <div className="flex items-center gap-2 rounded-lg bg-red-50 border border-red-200 px-4 py-3 text-sm text-red-700">
           <AlertTriangle className="h-4 w-4 flex-shrink-0" />{error}
         </div>
@@ -98,17 +157,44 @@ export default function AuditPage() {
           </div>
           {progress > 0 && <p className="text-xs text-gray-400 text-right">{progress}%</p>}
           <div className="grid grid-cols-4 gap-2 pt-2">
-            {["running", "judging", "analysing", "complete"].map((s, i) => {
-              const si = ["running","judging","analysing","complete"].indexOf(status?.status ?? "");
+            {["Running", "Judging", "Analysing", "Complete"].map((label, i) => {
+              // Map backend status → step index (0=Running, 1=Judging, 2=Analysing, 3=Complete)
+              const statusMap: Record<string, number> = {
+                battery_ready: -1, created: -1,
+                running: 0, probes_complete: 0,
+                judging: 1, judged: 1,
+                analysing: 2, analysed: 3, complete: 3,
+                report_ready: 3, generating_report: 3,
+              };
+              const si = statusMap[status?.status ?? ""] ?? -1;
               return (
-                <div key={s} className="flex items-center gap-1.5 text-xs">
+                <div key={label} className="flex items-center gap-1.5 text-xs">
                   <div className={cn("h-2 w-2 rounded-full flex-shrink-0", si > i ? "bg-risk-compliant" : si === i ? "bg-brand animate-pulse" : "bg-gray-200")} />
                   <span className={cn(si > i ? "text-risk-compliant" : si === i ? "text-brand font-medium" : "text-gray-300")}>
-                    {s.charAt(0).toUpperCase() + s.slice(1)}
+                    {label}
                   </span>
                 </div>
               );
             })}
+          </div>
+        </div>
+      )}
+
+      {isFailed && !results && (
+        <div className="card p-8 text-center space-y-4 animate-fade-in">
+          <AlertTriangle className="h-12 w-12 text-red-400 mx-auto" />
+          <h2 className="text-xl font-bold text-[#1A1A2E]">Audit Failed</h2>
+          <p className="text-sm text-gray-500 max-w-md mx-auto">
+            {STATUS_LABELS[status?.status ?? ""] ?? "Something went wrong during the audit pipeline."}
+            {error && <><br /><span className="text-red-500">{error}</span></>}
+          </p>
+          <div className="flex items-center justify-center gap-3 pt-2">
+            <button onClick={() => router.push("/dashboard")} className="btn-secondary flex items-center gap-2">
+              <ArrowLeft className="h-4 w-4" /> Dashboard
+            </button>
+            <button onClick={() => router.push("/audit/new")} className="btn-primary">
+              Start New Audit
+            </button>
           </div>
         </div>
       )}
@@ -120,7 +206,7 @@ export default function AuditPage() {
               { label: "Attributes",  value: Object.keys(results.per_attribute ?? {}).length },
               { label: "Regulations", value: results.regulatory_flags?.length ?? 0 },
               { label: "Risk Level",  value: results.risk_level?.replace(/_/g, " ") ?? "—" },
-              { label: "Score",       value: `${results.fairness_score?.toFixed(0)} / 100` },
+              { label: "Score",       value: results.fairness_score != null && !isNaN(results.fairness_score) ? `${results.fairness_score.toFixed(0)} / 100` : "N/A" },
             ].map(m => (
               <div key={m.label} className="card px-4 py-4">
                 <p className="text-xs text-gray-400 font-medium uppercase tracking-wide">{m.label}</p>

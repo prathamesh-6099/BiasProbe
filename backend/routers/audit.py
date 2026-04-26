@@ -99,8 +99,13 @@ class AuditStatusResponse(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
+_firestore_client = None
+
 def _db() -> _fs.Client:
-    return _fs.Client()
+    global _firestore_client
+    if _firestore_client is None:
+        _firestore_client = _fs.Client()
+    return _firestore_client
 
 
 def _config_from_request(req: ConnectorConfigIn) -> ConnectorConfig:
@@ -125,22 +130,24 @@ def _config_from_request(req: ConnectorConfigIn) -> ConnectorConfig:
 async def _run_battery_task(audit_id: str, config: ConnectorConfig) -> None:
     """
     Background coroutine that:
-    1. Loads the probe battery from GCS (via ProbeGenerator).
+    1. Loads the probe battery from Firestore (via ProbeGenerator).
     2. Sends all probes through LLMConnector.
-    3. Updates Firestore audit status to 'complete' or 'failed'.
+    3. Chains: Judge -> Stats.
+    4. Updates Firestore audit status at each stage.
     """
     db = _db()
     audit_ref = db.collection("audits").document(audit_id)
+    loop = asyncio.get_event_loop()
 
     try:
         # Mark as running
-        audit_ref.set({"status": "running"}, merge=True)
+        await loop.run_in_executor(None, lambda: audit_ref.set({"status": "running"}, merge=True))
         log.info("audit=%s | background task started", audit_id)
 
         # Load battery
-        battery = _generator.load_battery(audit_id)
+        battery = await loop.run_in_executor(None, _generator.load_battery, audit_id)
         probe_count = len(battery)
-        audit_ref.set({"probes_sent": probe_count, "probes_complete": 0}, merge=True)
+        await loop.run_in_executor(None, lambda: audit_ref.set({"probes_sent": probe_count, "probes_complete": 0}, merge=True))
 
         # Send probes
         results = await _connector.send_probes(config, battery, audit_id)
@@ -148,25 +155,58 @@ async def _run_battery_task(audit_id: str, config: ConnectorConfig) -> None:
         success = sum(1 for r in results if r.status == "success")
         failed  = sum(1 for r in results if r.status != "success")
 
-        audit_ref.set(
-            {
-                "status": "complete",
-                "probes_complete": len(results),
-                "probes_success": success,
-                "probes_failed": failed,
-            },
-            merge=True,
-        )
-        log.info("audit=%s | complete — success=%d failed=%d", audit_id, success, failed)
+        def _set_complete():
+            audit_ref.set(
+                {
+                    "status": "probes_complete",
+                    "probes_complete": len(results),
+                    "probes_success": success,
+                    "probes_failed": failed,
+                },
+                merge=True,
+            )
+        await loop.run_in_executor(None, _set_complete)
+        log.info("audit=%s | probes complete — success=%d failed=%d", audit_id, success, failed)
+
+        if success == 0:
+            await loop.run_in_executor(None, lambda: audit_ref.set({"status": "failed", "error": "All probes failed"}, merge=True))
+            return
+
+        # Chain: Judge
+        from routers.judge import _judge_battery_task
+        await _judge_battery_task(audit_id)
+
+        # Check if judging succeeded before running stats
+        doc = await loop.run_in_executor(None, lambda: audit_ref.get())
+        judge_status = doc.to_dict().get("status", "")
+        if judge_status in ("judge_failed", "failed"):
+            log.warning("audit=%s | skipping stats — judging failed (status=%s)", audit_id, judge_status)
+            return
+
+        # Chain: Stats
+        from routers.stats import _stats_task
+        await _stats_task(audit_id)
 
     except Exception as exc:  # noqa: BLE001
-        log.error("audit=%s | background task error: %s", audit_id, exc)
-        audit_ref.set({"status": "failed", "error": str(exc)}, merge=True)
+        log.error("audit=%s | background task error: %s", audit_id, exc, exc_info=True)
+        await loop.run_in_executor(None, lambda: audit_ref.set({"status": "failed", "error": str(exc)}, merge=True))
 
 
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
+@router.post("/test-connection", summary="Test the LLM connection credentials")
+async def test_connection(req: ConnectorConfigIn) -> dict:
+    """Validate the provided LLM credentials without creating an audit."""
+    config = _config_from_request(req)
+    validation = await _connector.validate_config(config)
+    if not validation["ok"]:
+        raise HTTPException(
+            status_code=422,
+            detail=validation.get("error", "Unknown connection error"),
+        )
+    return {"ok": True, "message": "Connection successful!"}
 
 @router.post("/create", response_model=CreateAuditResponse, summary="Create and validate a new audit")
 async def create_audit(req: CreateAuditRequest) -> CreateAuditResponse:
@@ -274,8 +314,9 @@ async def run_audit(audit_id: str, background_tasks: BackgroundTasks) -> RunAudi
 
     # Schedule background work
     background_tasks.add_task(
-        asyncio.ensure_future,
-        _run_battery_task(audit_id, config),
+        _run_battery_task,
+        audit_id,
+        config,
     )
 
     return RunAuditResponse(
@@ -317,8 +358,9 @@ async def run_audit_with_config(
     config = _config_from_request(req.connector)
 
     background_tasks.add_task(
-        asyncio.ensure_future,
-        _run_battery_task(audit_id, config),
+        _run_battery_task,
+        audit_id,
+        config,
     )
 
     return RunAuditResponse(
@@ -392,6 +434,34 @@ async def get_audit_results(
 
     docs = [d.to_dict() for d in query.stream()]
     return {"audit_id": audit_id, "count": len(docs), "results": docs}
+
+
+@router.get("/list", summary="List all audits")
+async def list_audits(
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+) -> dict:
+    """
+    Return all audits ordered by creation date.
+    Used by the dashboard.
+    """
+    db = _db()
+    ref = db.collection("audits").order_by("created_at", direction=_fs.Query.DESCENDING).limit(limit)
+    audits = []
+    for doc in ref.stream():
+        d = doc.to_dict()
+        audits.append({
+            "audit_id":               d.get("audit_id", doc.id),
+            "label":                  d.get("label", "Untitled"),
+            "scenario":               d.get("scenario", ""),
+            "provider":               d.get("connector", {}).get("provider", ""),
+            "status":                 d.get("status", "unknown"),
+            "fairness_score":         d.get("overall_fairness_score"),
+            "risk_level":             d.get("overall_severity"),
+            "certification_eligible": d.get("overall_severity") == "compliant" if d.get("overall_severity") else None,
+            "created_at":             str(d.get("created_at", "")),
+            "latest_report_id":       d.get("latest_report_id"),
+        })
+    return {"audits": audits}
 
 
 # Needed for the /run fallback env-var path
