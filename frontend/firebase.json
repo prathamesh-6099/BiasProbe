@@ -28,15 +28,15 @@
       {
         "source": "/api/**",
         "run": {
-          "serviceId": "biasprobe-backend",
-          "region": "us-central1"
+          "serviceId": "biasprobe-backend-213259930534",
+          "region": "asia-south1"
         }
       },
       {
         "source": "**",
         "run": {
           "serviceId": "biasprobe-frontend",
-          "region": "us-central1"
+          "region": "asia-south1"
         }
       }
     ]

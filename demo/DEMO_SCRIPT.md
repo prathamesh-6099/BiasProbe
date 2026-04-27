@@ -7,11 +7,11 @@
 
 ## ⚡ Pre-Demo Checklist (do these 10 min before stage time)
 
-- [ ] `cd demo && uvicorn biased_mock_api:app --port 8001 --reload` — mock API running
-- [ ] Backend running: `cd backend && uvicorn main:app --port 8000`
+- [ ] Mock API running at: `https://biasprobe-mock-api-213259930534.asia-south1.run.app`
+- [ ] Backend running at: `https://biasprobe-backend-213259930534.asia-south1.run.app`
 - [ ] Frontend running: `cd frontend && npm run dev`  → open `http://localhost:3000`
 - [ ] Browser tab pre-loaded on **New Audit** page
-- [ ] Demo API key pre-filled in the UI (`http://localhost:8001/v1`)
+- [ ] Demo API key pre-filled in the UI (`https://biasprobe-mock-api-213259930534.asia-south1.run.app/v1`)
 - [ ] Second browser tab ready on the **Audit Results** page with a *completed* prior run
 - [ ] Screen resolution: 1920×1080, browser zoom 110%
 
@@ -39,7 +39,7 @@
 
 **[On the New Audit form:]**
 
-1. **API Endpoint** → paste `http://localhost:8001/v1` *(pre-configured for demo)*
+1. **API Endpoint** → paste `https://biasprobe-mock-api-213259930534.asia-south1.run.app/v1` *(pre-configured for demo)*
 2. **Scenario** → select **"Hiring Assistant"** from the dropdown
 3. **Probe count** → set to **200**
 4. Click **"Launch Audit"** → watch the progress bar animate
